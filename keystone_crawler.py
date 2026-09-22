@@ -124,6 +124,8 @@ CONFIG = {
 
 FIELDS = ["Oldest Year", "Newest Year", "Brand", "Model", "Type",
           "Interchange Number", "OEM Number"]
+NUMBER_VALUES_FIELD = "Number Values"
+MULTIPLE_NUMBER_FIELD = "Multiple Number"
 
 # Regexes used to recognise column headers / labels / JSON keys on the site.
 FIELD_PATTERNS = {
@@ -167,6 +169,29 @@ def clean(v):
     if v is None:
         return ""
     return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def normalize_number_tokens(value):
+    """Return unique numbers from a free-form field while keeping a stable order."""
+    tokens = []
+    seen = set()
+    if value is None:
+        return tokens
+    for piece in re.split(r"[;|,\/\n]+", str(value)):
+        for token in re.findall(r"[A-Za-z0-9-]+", piece):
+            token = token.strip()
+            if not token:
+                continue
+            key = token.upper()
+            if key not in seen:
+                seen.add(key)
+                tokens.append(token)
+    return tokens
+
+
+def is_multiple_number(value):
+    """Return True when a field contains more than one distinct number candidate."""
+    return len(normalize_number_tokens(value)) > 1
 
 
 def map_pairs(pairs):
@@ -308,10 +333,16 @@ def extract(page, captured_json, part=None):
                 rec[f] = page_rec[f]
         row = {f: rec.get(f, "") for f in FIELDS}
 
-        interchange = oem_values.get("interchange") or pick_best_interchange(row.get("Interchange Number", ""))
-        oem = oem_values.get("oem") or pick_best_oem(row.get("OEM Number", ""), part)
-        row["Interchange Number"] = interchange
-        row["OEM Number"] = oem
+        interchange_value = oem_values.get("interchange") or row.get("Interchange Number", "")
+        oem_value = oem_values.get("oem") or row.get("OEM Number", "")
+        row["Interchange Number"] = interchange_value.split(",")[0].strip() if interchange_value else ""
+        row["OEM Number"] = oem_value.split(",")[0].strip() if oem_value else ""
+        row[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
+            filter(None, [interchange_value, oem_value])
+        )
+        row[MULTIPLE_NUMBER_FIELD] = bool(oem_values.get("multiple")) or (
+            is_multiple_number(interchange_value) or is_multiple_number(oem_value)
+        )
 
         key = tuple(row.values())
         if any(key) and key not in seen:
@@ -320,8 +351,14 @@ def extract(page, captured_json, part=None):
 
     if not rows and any(oem_values.values()):
         fallback = {f: "" for f in FIELDS}
-        fallback["Interchange Number"] = oem_values.get("interchange", "")
-        fallback["OEM Number"] = oem_values.get("oem", "")
+        interchange_value = oem_values.get("interchange", "")
+        oem_value = oem_values.get("oem", "")
+        fallback["Interchange Number"] = interchange_value.split(",")[0].strip() if interchange_value else ""
+        fallback["OEM Number"] = oem_value.split(",")[0].strip() if oem_value else ""
+        fallback[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
+            filter(None, [interchange_value, oem_value])
+        )
+        fallback[MULTIPLE_NUMBER_FIELD] = bool(oem_values.get("multiple"))
         rows.append(fallback)
 
     return rows
@@ -371,10 +408,20 @@ def pick_best_oem(value, part=None):
                 cleaned.append(token)
 
     if cleaned:
-        return cleaned[0]
+        return ", ".join(cleaned)
     if part_match:
         return part_match
     return ""
+
+
+def is_oem_candidate(token):
+    """Accept common OEM identifiers that contain letters and digits in either order."""
+    if not token:
+        return False
+    token = token.strip()
+    if token.upper() in {"OEM", "INTERCHANGE", "DETAILS", "FITS", "NUMBER", "PART"}:
+        return False
+    return bool(re.search(r"(?i)(?:[A-Za-z]{1,8}\d{3,8}|\d{3,8}[A-Za-z]{1,8}|[A-Za-z]{1,8}[-_ ]?\d{3,8}|\d{3,8}[-_ ]?[A-Za-z]{1,8})", token))
 
 
 def extract_oem_tab_values(page, part=None):
@@ -383,13 +430,13 @@ def extract_oem_tab_values(page, part=None):
     try:
         wrapper = page.locator('.mat-tab-body-wrapper')
         if wrapper.count() == 0:
-            return {"interchange": "", "oem": ""}
+            return {"interchange": "", "oem": "", "multiple": False}
         tab_text = wrapper.first.inner_text() or ""
     except Exception:
-        return {"interchange": "", "oem": ""}
+        return {"interchange": "", "oem": "", "multiple": False}
 
     if not tab_text:
-        return {"interchange": "", "oem": ""}
+        return {"interchange": "", "oem": "", "multiple": False}
 
     print(f"Reading OEM tab values: {tab_text[:250]}")
     interchange_candidates = []
@@ -402,13 +449,17 @@ def extract_oem_tab_values(page, part=None):
             continue
         if re.search(r"(?i)(?:[A-Za-z0-9]{2,8})-\d{5,7}", token):
             interchange_candidates.append(token)
-        elif re.search(r"(?i)(?:[A-Za-z]+\d{5,7}|\d{3}\d{5,7})", token):
+        elif is_oem_candidate(token):
             oem_candidates.append(token)
 
-    interchange = pick_best_interchange(", ".join(interchange_candidates))
-    oem = pick_best_oem(", ".join(oem_candidates), part)
-    print(f"Parsed OEM values -> Interchange: {interchange}, OEM: {oem}")
-    return {"interchange": interchange, "oem": oem}
+    interchange_tokens = normalize_number_tokens(", ".join(interchange_candidates))
+    oem_tokens = normalize_number_tokens(", ".join(oem_candidates))
+    interchange = ", ".join(interchange_tokens) if len(interchange_tokens) > 1 else (interchange_tokens[0] if interchange_tokens else "")
+    oem = ", ".join(oem_tokens) if len(oem_tokens) > 1 else (oem_tokens[0] if oem_tokens else "")
+    number_values = ", ".join(filter(None, [interchange, oem]))
+    multiple = len(interchange_tokens) > 1 or len(oem_tokens) > 1
+    print(f"Parsed OEM values -> Interchange: {interchange}, OEM: {oem}, Number Values: {number_values}, Multiple: {multiple}")
+    return {"interchange": interchange, "oem": oem, "number_values": number_values, "multiple": multiple}
 
 
 def open_oem_tab(page):
@@ -709,13 +760,16 @@ def read_parts(path, column):
     return parts
 
 
-OUT_COLS = ["Partslink Number"] + FIELDS + ["Status"]
+OUT_COLS = ["Partslink Number"] + FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
 
 
 def load_results(path):
     results = {}
     if Path(path).exists():
         df = pd.read_excel(path, dtype=str).fillna("")
+        for col in OUT_COLS:
+            if col not in df.columns:
+                df[col] = ""
         for _, r in df.iterrows():
             results.setdefault(r["Partslink Number"], []).append({c: r.get(c, "") for c in OUT_COLS})
     return results
@@ -725,7 +779,12 @@ def save_results(path, order, results):
     rows = []
     for part in order:
         rows.extend(results.get(part, []))
-    pd.DataFrame(rows, columns=OUT_COLS).to_excel(path, index=False)
+    df = pd.DataFrame(rows, columns=OUT_COLS)
+    for col in OUT_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[OUT_COLS]
+    df.to_excel(path, index=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -797,6 +856,8 @@ def run(args):
                         time.sleep(2)
                 if not rows:
                     rows = [{f: "" for f in FIELDS}]
+                    rows[0][NUMBER_VALUES_FIELD] = ""
+                    rows[0][MULTIPLE_NUMBER_FIELD] = False
                 results[part] = [{"Partslink Number": part, **r, "Status": status} for r in rows]
                 for row in rows:
                     inter = row.get("Interchange Number", "") or ""
