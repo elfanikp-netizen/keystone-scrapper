@@ -71,7 +71,9 @@ The output includes:
 - `Model`
 - `Type`
 - `Interchange Number`
+- `Interchange 1` to `Interchange 5`
 - `OEM Number`
+- `OEM 1` to `OEM 5`
 - `Status`
 
 ## Troubleshooting

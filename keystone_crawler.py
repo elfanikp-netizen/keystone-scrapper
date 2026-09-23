@@ -5,7 +5,9 @@ Keystone (preview.orderkeystone.com/crash) Partslink crawler.
 Reads Partslink numbers from an Excel file, logs in once, searches each number
 on the site and writes these columns to an Excel file:
 
-    Oldest Year, Newest Year, Brand, Model, Type, Interchange Number, OEM Number
+    Oldest Year, Newest Year, Brand, Model, Type, Interchange Number, OEM Number,
+    Interchange 1, Interchange 2, Interchange 3, Interchange 4, Interchange 5,
+    OEM 1, OEM 2, OEM 3, OEM 4, OEM 5
 
 Typical use:
     python keystone_crawler.py --make-template          # creates parts.xlsx
@@ -124,6 +126,8 @@ CONFIG = {
 
 FIELDS = ["Oldest Year", "Newest Year", "Brand", "Model", "Type",
           "Interchange Number", "OEM Number"]
+INTERCHANGE_FIELDS = [f"Interchange {n}" for n in range(1, 6)]
+OEM_FIELDS = [f"OEM {n}" for n in range(1, 6)]
 NUMBER_VALUES_FIELD = "Number Values"
 MULTIPLE_NUMBER_FIELD = "Multiple Number"
 
@@ -187,6 +191,26 @@ def normalize_number_tokens(value):
                 seen.add(key)
                 tokens.append(token)
     return tokens
+
+
+def split_number_values(value, max_items=5):
+    """Split a free-form number field into up to max_items unique values."""
+    return normalize_number_tokens(value)[:max_items]
+
+
+def apply_number_slots(row, interchange_value="", oem_value=""):
+    """Populate the canonical and numbered OEM/interchange columns."""
+    interchange_tokens = split_number_values(interchange_value)
+    oem_tokens = split_number_values(oem_value)
+
+    row["Interchange Number"] = interchange_tokens[0] if interchange_tokens else ""
+    row["OEM Number"] = oem_tokens[0] if oem_tokens else ""
+
+    for index in range(1, 6):
+        row[f"Interchange {index}"] = interchange_tokens[index - 1] if index <= len(interchange_tokens) else ""
+        row[f"OEM {index}"] = oem_tokens[index - 1] if index <= len(oem_tokens) else ""
+
+    return row
 
 
 def is_multiple_number(value):
@@ -335,8 +359,7 @@ def extract(page, captured_json, part=None):
 
         interchange_value = oem_values.get("interchange") or row.get("Interchange Number", "")
         oem_value = oem_values.get("oem") or row.get("OEM Number", "")
-        row["Interchange Number"] = interchange_value.split(",")[0].strip() if interchange_value else ""
-        row["OEM Number"] = oem_value.split(",")[0].strip() if oem_value else ""
+        row = apply_number_slots(row, interchange_value, oem_value)
         row[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
             filter(None, [interchange_value, oem_value])
         )
@@ -351,10 +374,11 @@ def extract(page, captured_json, part=None):
 
     if not rows and any(oem_values.values()):
         fallback = {f: "" for f in FIELDS}
+        for field in INTERCHANGE_FIELDS + OEM_FIELDS:
+            fallback[field] = ""
         interchange_value = oem_values.get("interchange", "")
         oem_value = oem_values.get("oem", "")
-        fallback["Interchange Number"] = interchange_value.split(",")[0].strip() if interchange_value else ""
-        fallback["OEM Number"] = oem_value.split(",")[0].strip() if oem_value else ""
+        fallback = apply_number_slots(fallback, interchange_value, oem_value)
         fallback[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
             filter(None, [interchange_value, oem_value])
         )
@@ -421,17 +445,29 @@ def is_oem_candidate(token):
     token = token.strip()
     if token.upper() in {"OEM", "INTERCHANGE", "DETAILS", "FITS", "NUMBER", "PART"}:
         return False
-    return bool(re.search(r"(?i)(?:[A-Za-z]{1,8}\d{3,8}|\d{3,8}[A-Za-z]{1,8}|[A-Za-z]{1,8}[-_ ]?\d{3,8}|\d{3,8}[-_ ]?[A-Za-z]{1,8})", token))
+    if token.isdigit() and len(token) < 5:
+        return False
+    if re.fullmatch(r"\d{5,12}", token):
+        return True
+    if not re.fullmatch(r"(?i)[A-Za-z0-9][A-Za-z0-9-_ ]{4,19}", token):
+        return False
+    return bool(re.search(r"[A-Za-z]", token) and re.search(r"\d", token))
 
 
 def extract_oem_tab_values(page, part=None):
     """Read the visible values from the OEM tab wrapper and normalize them."""
     open_oem_tab(page)
     try:
-        wrapper = page.locator('.mat-tab-body-wrapper')
-        if wrapper.count() == 0:
+        bodies = page.locator('.mat-tab-body-wrapper .mat-tab-body')
+        if bodies.count() == 0:
             return {"interchange": "", "oem": "", "multiple": False}
-        tab_text = wrapper.first.inner_text() or ""
+        active = page.locator('.mat-tab-body-wrapper .mat-tab-body-active')
+        candidates = active if active.count() else bodies
+        tab_text = ""
+        for index in range(candidates.count()):
+            tab_text = candidates.nth(index).inner_text() or ""
+            if tab_text.strip():
+                break
     except Exception:
         return {"interchange": "", "oem": "", "multiple": False}
 
@@ -760,7 +796,7 @@ def read_parts(path, column):
     return parts
 
 
-OUT_COLS = ["Partslink Number"] + FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
+OUT_COLS = ["Partslink Number"] + FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
 
 
 def load_results(path):
