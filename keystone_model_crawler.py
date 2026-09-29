@@ -30,6 +30,7 @@ OUTPUT_COLUMNS = [
     "Brand",
     "Model",
     "Interchange Number",
+    "Part Type",
     "OEM Number",
     *INTERCHANGE_FIELDS,
     *OEM_FIELDS,
@@ -59,6 +60,12 @@ def split_categories(value):
 def parse_year_bounds(text):
     years = [int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", text or "")]
     return (str(min(years)), str(max(years))) if years else ("", "")
+
+
+def part_type_from_interchange(value):
+    tokens = base.normalize_number_tokens(value)
+    match = re.search(r"\d{3}", tokens[0]) if tokens else None
+    return match.group(0) if match else ""
 
 
 def read_search_rows(path):
@@ -362,6 +369,7 @@ def extract_result(page, record, result_text):
         "Brand": record["Brand"],
         "Model": record["Model"],
         "Interchange Number": numbers.get("interchange", ""),
+        "Part Type": part_type_from_interchange(numbers.get("interchange", "")),
         "OEM Number": numbers.get("oem", ""),
         "Number Values": numbers.get("number_values", ""),
         "Description": description,

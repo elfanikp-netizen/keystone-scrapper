@@ -3,6 +3,7 @@ import unittest
 from keystone_model_crawler import (
     OUTPUT_COLUMNS,
     _partslink_from_text,
+    part_type_from_interchange,
     parse_year_bounds,
     split_categories,
 )
@@ -22,6 +23,10 @@ class ModelCrawlerTests(unittest.TestCase):
 
     def test_partslink_suffix_is_preserved(self):
         self.assertEqual(_partslink_from_text("TO1000432C Available Local"), "TO1000432C")
+
+    def test_part_type_uses_first_three_digits_of_first_interchange(self):
+        self.assertEqual(part_type_from_interchange("101-10156, 187-10224"), "101")
+        self.assertEqual(part_type_from_interchange(""), "")
 
 
 if __name__ == "__main__":
