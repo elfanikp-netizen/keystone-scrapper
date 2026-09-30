@@ -6,4 +6,4 @@ __pycache__/
 *.pyo
 *.pyd
 *.xlsx
-debug/*.png
+debug/

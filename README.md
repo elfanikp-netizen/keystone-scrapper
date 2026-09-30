@@ -1,6 +1,6 @@
 # Keystone Partslink Crawler
 
-This project crawls the Keystone crash catalog, reads Partslink numbers from an Excel file, and exports matched result rows into an Excel report.
+This project searches the Keystone crash catalog using a number column from an Excel file and exports matched result rows into an Excel report.
 
 ## Requirements
 
@@ -52,9 +52,16 @@ Optional filters:
 ```bash
 python keystone_crawler.py --limit 5
 python keystone_crawler.py --input my_parts.xlsx --column "Partslink Number"
+python keystone_crawler.py --input parts.xlsx --column "Interchange Number" --show --limit 1 --output interchange_results.xlsx
+python keystone_crawler.py --input parts.xlsx --column "Interchange Number" --output interchange_results.xlsx
+python keystone_crawler.py --output custom_results.xlsx
 python keystone_crawler.py --fresh
 python keystone_crawler.py --manual-login
 ```
+
+`--column` must exactly match a header in the input workbook. If omitted, the crawler selects the `Partslink Number` column when available, otherwise the first column. For a custom column, the crawler selects a result card containing the searched value when possible; when Keystone does not display that value on its cards (as with interchange searches), it opens the first returned product card and extracts its detail data, matching the Partslink search flow. A nonexistent column is reported as an error rather than silently switching to another column.
+
+Use `--output` to choose the report workbook path. The default is `keystone_results.xlsx`. The selected input column is also used as the search identifier in the report and when resuming completed searches. If its name conflicts with a catalog result field, `Search ` is prepended; for example, searching `Interchange Number` writes the searched value under `Search Interchange Number`.
 
 ## Output
 
@@ -64,7 +71,7 @@ The script writes results to:
 
 The output includes:
 
-- `Partslink Number`
+- The selected search identifier (`Partslink Number` by default)
 - `Oldest Year`
 - `Newest Year`
 - `Brand`
@@ -74,6 +81,8 @@ The output includes:
 - `Interchange 1` to `Interchange 5`
 - `OEM Number`
 - `OEM 1` to `OEM 5`
+- `Number Values`
+- `Multiple Number`
 - `Status`
 
 ## Troubleshooting

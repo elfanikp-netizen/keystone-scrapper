@@ -130,9 +130,11 @@ INTERCHANGE_FIELDS = [f"Interchange {n}" for n in range(1, 6)]
 OEM_FIELDS = [f"OEM {n}" for n in range(1, 6)]
 NUMBER_VALUES_FIELD = "Number Values"
 MULTIPLE_NUMBER_FIELD = "Multiple Number"
+PARTSLINK_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{2}\d{7}(?![A-Za-z0-9])")
 
 # Regexes used to recognise column headers / labels / JSON keys on the site.
 FIELD_PATTERNS = {
+    "Partslink Number": [r"parts\s*-?\s*link"],
     "Oldest Year": [
         r"(oldest|earliest|start|begin|from|min)\s*(year|yr)",
         r"(year|yr)\s*(start|from|begin|min)",
@@ -175,6 +177,23 @@ def clean(v):
     return re.sub(r"\s+", " ", str(v)).strip()
 
 
+def extract_partslink_number(value):
+    """Find a Partslink identifier containing two letters followed by seven digits."""
+    if isinstance(value, dict):
+        values = value.values()
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        match = PARTSLINK_PATTERN.search(str(value))
+        return match.group(0).upper() if match else ""
+
+    for item in values:
+        found = extract_partslink_number(item)
+        if found:
+            return found
+    return ""
+
+
 def normalize_number_tokens(value):
     """Return unique numbers from a free-form field while keeping a stable order."""
     tokens = []
@@ -186,11 +205,19 @@ def normalize_number_tokens(value):
             token = token.strip()
             if not token:
                 continue
+            if PARTSLINK_PATTERN.fullmatch(token):
+                continue
             key = token.upper()
             if key not in seen:
                 seen.add(key)
                 tokens.append(token)
     return tokens
+
+
+def join_number_values(*values):
+    """Join normalized OEM/interchange values without Partslink identifiers."""
+    tokens = normalize_number_tokens(", ".join(str(value) for value in values if value))
+    return CONFIG["list_join"].join(tokens)
 
 
 def split_number_values(value, max_items=5):
@@ -211,6 +238,15 @@ def apply_number_slots(row, interchange_value="", oem_value=""):
         row[f"OEM {index}"] = oem_tokens[index - 1] if index <= len(oem_tokens) else ""
 
     return row
+
+
+def number_values_from_row(row):
+    """Combine populated OEM and interchange columns, with OEM values first."""
+    oem_values = [row.get("OEM Number", "")]
+    oem_values.extend(row.get(f"OEM {index}", "") for index in range(1, 6))
+    interchange_values = [row.get("Interchange Number", "")]
+    interchange_values.extend(row.get(f"Interchange {index}", "") for index in range(1, 6))
+    return join_number_values(*oem_values, *interchange_values)
 
 
 def is_multiple_number(value):
@@ -335,14 +371,24 @@ def score(recs):
     return sum(len(r) for r in recs)
 
 
-def extract(page, captured_json, part=None):
+def is_interchange_search(search_column):
+    return bool(re.search(r"\binterchange\b", str(search_column), re.I))
+
+
+def extract(page, captured_json, part=None, search_column="Partslink Number"):
     json_recs = []
     for _, body in captured_json:
         walk_json(body, {}, json_recs)
 
     dom = page.evaluate(DOM_JS)
+    interchange_search = is_interchange_search(search_column)
+    parsed_partslink = "" if interchange_search else extract_partslink_number([
+        dom.get("body", ""),
+        [body for _, body in captured_json],
+    ])
     table_recs = dom_records(dom)
     page_rec = map_pairs(page_level_pairs(dom))
+    page_partslink = extract_partslink_number(page_rec)
 
     if not table_recs and len(page_rec) >= 2:
         table_recs = [dict(page_rec)]
@@ -350,21 +396,33 @@ def extract(page, captured_json, part=None):
     best = json_recs if score(json_recs) >= score(table_recs) else table_recs
 
     rows, seen = [], set()
-    oem_values = extract_oem_tab_values(page, part)
+    oem_values = extract_oem_tab_values(
+        page,
+        part,
+        exclude_search_value=not interchange_search,
+    )
     for rec in best:
         for f in FIELDS:                      # fill gaps from page-level labels
             if f not in rec and f in page_rec:
                 rec[f] = page_rec[f]
         row = {f: rec.get(f, "") for f in FIELDS}
 
-        interchange_value = oem_values.get("interchange") or row.get("Interchange Number", "")
+        interchange_value = (
+            oem_values.get("interchange")
+            or row.get("Interchange Number", "")
+            or (part if interchange_search else "")
+        )
         oem_value = oem_values.get("oem") or row.get("OEM Number", "")
         row = apply_number_slots(row, interchange_value, oem_value)
-        row[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
-            filter(None, [interchange_value, oem_value])
-        )
+        row[NUMBER_VALUES_FIELD] = number_values_from_row(row)
         row[MULTIPLE_NUMBER_FIELD] = bool(oem_values.get("multiple")) or (
             is_multiple_number(interchange_value) or is_multiple_number(oem_value)
+        )
+        row["Partslink Number"] = (
+            extract_partslink_number(rec.get("Partslink Number", ""))
+            or (page_partslink if interchange_search else "")
+            or (extract_partslink_number(rec) if not interchange_search else "")
+            or parsed_partslink
         )
 
         key = tuple(row.values())
@@ -376,13 +434,21 @@ def extract(page, captured_json, part=None):
         fallback = {f: "" for f in FIELDS}
         for field in INTERCHANGE_FIELDS + OEM_FIELDS:
             fallback[field] = ""
-        interchange_value = oem_values.get("interchange", "")
+        interchange_value = oem_values.get("interchange", "") or (
+            part if interchange_search else ""
+        )
         oem_value = oem_values.get("oem", "")
         fallback = apply_number_slots(fallback, interchange_value, oem_value)
-        fallback[NUMBER_VALUES_FIELD] = oem_values.get("number_values") or ", ".join(
-            filter(None, [interchange_value, oem_value])
-        )
+        fallback[NUMBER_VALUES_FIELD] = number_values_from_row(fallback)
         fallback[MULTIPLE_NUMBER_FIELD] = bool(oem_values.get("multiple"))
+        fallback["Partslink Number"] = page_partslink or parsed_partslink
+        rows.append(fallback)
+
+    if not rows and (page_partslink or parsed_partslink):
+        fallback = {field: "" for field in FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS}
+        fallback[NUMBER_VALUES_FIELD] = ""
+        fallback[MULTIPLE_NUMBER_FIELD] = False
+        fallback["Partslink Number"] = page_partslink or parsed_partslink
         rows.append(fallback)
 
     return rows
@@ -454,7 +520,7 @@ def is_oem_candidate(token):
     return bool(re.search(r"[A-Za-z]", token) and re.search(r"\d", token))
 
 
-def extract_oem_tab_values(page, part=None):
+def extract_oem_tab_values(page, part=None, exclude_search_value=True):
     """Read the visible values from the OEM tab wrapper and normalize them."""
     open_oem_tab(page)
     try:
@@ -481,7 +547,9 @@ def extract_oem_tab_values(page, part=None):
         token = token.strip()
         if not token:
             continue
-        if part and token.upper() == str(part).upper():
+        if PARTSLINK_PATTERN.fullmatch(token):
+            continue
+        if exclude_search_value and part and token.upper() == str(part).upper():
             continue
         if re.search(r"(?i)(?:[A-Za-z0-9]{2,8})-\d{5,7}", token):
             interchange_candidates.append(token)
@@ -492,7 +560,7 @@ def extract_oem_tab_values(page, part=None):
     oem_tokens = normalize_number_tokens(", ".join(oem_candidates))
     interchange = ", ".join(interchange_tokens) if len(interchange_tokens) > 1 else (interchange_tokens[0] if interchange_tokens else "")
     oem = ", ".join(oem_tokens) if len(oem_tokens) > 1 else (oem_tokens[0] if oem_tokens else "")
-    number_values = ", ".join(filter(None, [interchange, oem]))
+    number_values = join_number_values(interchange, oem)
     multiple = len(interchange_tokens) > 1 or len(oem_tokens) > 1
     print(f"Parsed OEM values -> Interchange: {interchange}, OEM: {oem}, Number Values: {number_values}, Multiple: {multiple}")
     return {"interchange": interchange, "oem": oem, "number_values": number_values, "multiple": multiple}
@@ -696,6 +764,33 @@ def find_search_box(page):
 
 def click_result_candidate(page, part):
     """Pick the most likely result entry after a search and open it."""
+    card_selectors = [
+        '#search-results-container .part-card',
+        '#search-results-container app-product-card',
+    ]
+    for selector in card_selectors:
+        try:
+            cards = page.locator(selector)
+            visible_cards = []
+            for index in range(cards.count()):
+                card = cards.nth(index)
+                if card.is_visible():
+                    visible_cards.append((card, card.inner_text() or ""))
+            if not visible_cards:
+                continue
+
+            selected = next(
+                (card for card, text in visible_cards if part.casefold() in text.casefold()),
+                visible_cards[0][0],
+            )
+            image = selected.locator(".part-card-image").first
+            target = image if image.count() and image.is_visible() else selected
+            target.click(timeout=8000)
+            wait_settled(page)
+            return True
+        except Exception:
+            continue
+
     selectors = [
         'tr', '[role="row"]', 'a', 'button', 'li', 'div[role="button"]',
         'table tbody tr', '[data-testid*="result" i]', '[class*="result" i]'
@@ -735,9 +830,9 @@ def click_result_candidate(page, part):
     return False
 
 
-def search_part(page, rec, part):
+def search_part(page, rec, part, search_label="Partslink Number"):
     rec.clear()
-    print(f"Searching Partslink: {part}")
+    print(f"Searching {search_label}: {part}")
     page.goto(CRASH_URL)
     wait_settled(page, 500)
     box = find_search_box(page)
@@ -777,7 +872,12 @@ def search_part(page, rec, part):
 def read_parts(path, column):
     df = pd.read_excel(path, dtype=str)
     col = None
-    if column and column in df.columns:
+    if column:
+        if column not in df.columns:
+            raise ValueError(
+                f"Column '{column}' was not found in '{path}'. "
+                f"Available columns: {', '.join(str(name) for name in df.columns)}"
+            )
         col = column
     else:
         for c in df.columns:
@@ -796,30 +896,82 @@ def read_parts(path, column):
     return parts
 
 
-OUT_COLS = ["Partslink Number"] + FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
+def read_partslink_mapping(path, search_column):
+    """Map each interchange query to its Partslink value from the paired input row."""
+    if not is_interchange_search(search_column):
+        return {}
+
+    df = pd.read_excel(path, dtype=str).fillna("")
+    headers = {str(column).strip().casefold(): column for column in df.columns}
+    partslink_column = headers.get("partslink number")
+    source_column = headers.get(search_column.strip().casefold())
+    if partslink_column is None or source_column is None:
+        return {}
+
+    mapping = {}
+    ambiguous = set()
+    for _, row in df[[source_column, partslink_column]].iterrows():
+        query = str(row[source_column]).strip()
+        partslink = str(row[partslink_column]).strip()
+        if not query or not partslink:
+            continue
+        if query in mapping and mapping[query] != partslink:
+            ambiguous.add(query)
+        else:
+            mapping[query] = partslink
+
+    for query in ambiguous:
+        mapping.pop(query, None)
+    return mapping
 
 
-def load_results(path):
+def apply_partslink_mapping(row, query, mapping):
+    """Use a paired source Partslink value when the search query has an unambiguous match."""
+    mapped_partslink = mapping.get(query, "")
+    if mapped_partslink:
+        row["Partslink Number"] = mapped_partslink
+    return row
+
+
+def search_result_column(search_column):
+    result_fields = FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
+    return f"Search {search_column}" if search_column in result_fields else search_column
+
+
+def output_columns(search_column="Partslink Number"):
+    columns = [search_result_column(search_column)]
+    if search_result_column(search_column).casefold() != "partslink number":
+        columns.append("Partslink Number")
+    return columns + FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS + [NUMBER_VALUES_FIELD, MULTIPLE_NUMBER_FIELD, "Status"]
+
+
+OUT_COLS = output_columns()
+
+
+def load_results(path, search_column="Partslink Number"):
     results = {}
+    result_column = search_result_column(search_column)
+    columns = output_columns(search_column)
     if Path(path).exists():
         df = pd.read_excel(path, dtype=str).fillna("")
-        for col in OUT_COLS:
+        for col in columns:
             if col not in df.columns:
                 df[col] = ""
         for _, r in df.iterrows():
-            results.setdefault(r["Partslink Number"], []).append({c: r.get(c, "") for c in OUT_COLS})
+            results.setdefault(r[result_column], []).append({c: r.get(c, "") for c in columns})
     return results
 
 
-def save_results(path, order, results):
+def save_results(path, order, results, search_column="Partslink Number"):
+    columns = output_columns(search_column)
     rows = []
     for part in order:
         rows.extend(results.get(part, []))
-    df = pd.DataFrame(rows, columns=OUT_COLS)
-    for col in OUT_COLS:
+    df = pd.DataFrame(rows, columns=columns)
+    for col in columns:
         if col not in df.columns:
             df[col] = ""
-    df = df[OUT_COLS]
+    df = df[columns]
     df.to_excel(path, index=False)
 
 
@@ -862,10 +1014,27 @@ def discover(args):
 
 
 def run(args):
-    parts = read_parts(args.input, args.column)
-    if args.limit:
-        parts = parts[: args.limit]
-    results = {} if args.fresh else load_results(args.output)
+    all_parts, search_column = read_parts(args.input, args.column), args.column
+    if not search_column:
+        input_frame = pd.read_excel(args.input, nrows=0)
+        search_column = next(
+            (str(column) for column in input_frame.columns if re.search(r"part\s*-?\s*link", str(column), re.I)),
+            str(input_frame.columns[0]),
+        )
+    parts = all_parts[: args.limit] if args.limit else all_parts
+    results = {} if args.fresh else load_results(args.output, search_column)
+    partslink_mapping = read_partslink_mapping(args.input, search_column)
+    if partslink_mapping:
+        backfilled = False
+        for query, rows in results.items():
+            mapped_partslink = partslink_mapping.get(query, "")
+            if mapped_partslink:
+                for row in rows:
+                    if row.get("Partslink Number") != mapped_partslink:
+                        row["Partslink Number"] = mapped_partslink
+                        backfilled = True
+        if backfilled:
+            save_results(args.output, all_parts, results, search_column)
     todo = [x for x in parts
             if not any(r["Status"] == "OK" for r in results.get(x, []))]
     print(f"{len(parts) - len(todo)} already done, {len(todo)} to process.")
@@ -881,8 +1050,8 @@ def run(args):
                 rows, status = [], "ERROR"
                 for attempt in range(1, CONFIG["retries"] + 2):
                     try:
-                        search_part(page, rec, part)
-                        rows = extract(page, rec.items, part)
+                        search_part(page, rec, part, search_column)
+                        rows = extract(page, rec.items, part, search_column)
                         status = "OK" if rows else "NO DATA"
                         if not rows:
                             save_debug(page, f"nodata_{re.sub(r'[^A-Za-z0-9_-]', '_', part)}")
@@ -894,7 +1063,14 @@ def run(args):
                     rows = [{f: "" for f in FIELDS}]
                     rows[0][NUMBER_VALUES_FIELD] = ""
                     rows[0][MULTIPLE_NUMBER_FIELD] = False
-                results[part] = [{"Partslink Number": part, **r, "Status": status} for r in rows]
+                result_column = search_result_column(search_column)
+                results[part] = []
+                for row in rows:
+                    result = {result_column: part, **row, "Status": status}
+                    result = apply_partslink_mapping(result, part, partslink_mapping)
+                    if search_column.strip().casefold() == "partslink number":
+                        result["Partslink Number"] = part
+                    results[part].append(result)
                 for row in rows:
                     inter = row.get("Interchange Number", "") or ""
                     oem = row.get("OEM Number", "") or ""
@@ -903,10 +1079,10 @@ def run(args):
                     print(f"[{n}/{len(todo)}] {part}: Interchange= | OEM= | Status={status}")
                 print(f"[{n}/{len(todo)}] {part}: {status} ({len(rows) if status == 'OK' else 0} row(s))")
                 if n % 10 == 0:
-                    save_results(args.output, parts, results)
+                    save_results(args.output, all_parts, results, search_column)
                 time.sleep(random.uniform(CONFIG["delay_min"], CONFIG["delay_max"]))
         finally:
-            save_results(args.output, parts, results)
+            save_results(args.output, all_parts, results, search_column)
             browser.close()
     print(f"\nDone. Results saved to {args.output}")
 
@@ -914,7 +1090,7 @@ def run(args):
 def main():
     ap = argparse.ArgumentParser(description="Keystone Partslink crawler")
     ap.add_argument("--input", default="parts.xlsx", help="Excel file with Partslink numbers")
-    ap.add_argument("--column", default="", help="Column name holding the numbers (auto-detected)")
+    ap.add_argument("--column", default="", help="Input column to search; it also identifies results")
     ap.add_argument("--output", default="keystone_results.xlsx")
     ap.add_argument("--show", action="store_true", help="Show the browser window")
     ap.add_argument("--limit", type=int, default=0, help="Only process the first N numbers")
