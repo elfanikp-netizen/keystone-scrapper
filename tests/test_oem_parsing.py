@@ -14,6 +14,7 @@ from keystone_crawler import (
     is_oem_candidate,
     join_number_values,
     normalize_number_tokens,
+    extract_oem_tab_values,
     output_columns,
     read_partslink_mapping,
     split_number_values,
@@ -23,8 +24,54 @@ from keystone_crawler import (
 class OemParsingTests(unittest.TestCase):
     def test_numeric_oem_values_are_accepted(self):
         self.assertTrue(is_oem_candidate("22818031"))
+        self.assertTrue(is_oem_candidate("16688518389999"))
+        self.assertTrue(is_oem_candidate("1668851838649999"))
         self.assertTrue(is_oem_candidate("A12345"))
         self.assertTrue(is_oem_candidate("12345A"))
+
+    def test_long_numeric_oem_values_are_parsed_from_interchange_result_tab(self):
+        class EmptyLocator:
+            first = None
+
+            def count(self):
+                return 0
+
+            def is_visible(self):
+                return False
+
+        class TabBody:
+            def inner_text(self):
+                return "\n".join([
+                    "101-10026",
+                    "HY1115122",
+                    "1668851838649999",
+                    "16688518389999",
+                    "MB1000528",
+                ])
+
+        class BodyLocator:
+            def count(self):
+                return 1
+
+            def nth(self, index):
+                return TabBody()
+
+        class Page:
+            def locator(self, selector):
+                if selector == ".mat-tab-body-wrapper .mat-tab-body":
+                    return BodyLocator()
+                if selector == ".mat-tab-body-wrapper .mat-tab-body-active":
+                    return EmptyLocator()
+                return EmptyLocator()
+
+        values = extract_oem_tab_values(Page(), "101-10026", exclude_search_value=False)
+        self.assertEqual(values["interchange"], "101-10026")
+        self.assertEqual(values["partslink"], "HY1115122")
+        self.assertEqual(values["oem"], "1668851838649999, 16688518389999")
+        self.assertEqual(
+            values["number_values"],
+            "101-10026, 1668851838649999, 16688518389999",
+        )
 
     def test_mixed_prefix_and_suffix_oem_values_are_accepted(self):
         self.assertTrue(is_oem_candidate("KT4216138A"))
@@ -90,6 +137,48 @@ class OemParsingTests(unittest.TestCase):
             self.assertEqual(row["Interchange Number"], "101-60187")
             self.assertEqual(row["OEM Number"], "2928851925")
             self.assertEqual(row[NUMBER_VALUES_FIELD], "2928851925, 101-60187")
+
+    def test_interchange_search_prefers_partslink_number_from_oem_tab(self):
+        class Page:
+            def evaluate(self, script):
+                return {
+                    "tables": [],
+                    "dl": [],
+                    "body": "Partslink Number: GM1095205",
+                }
+
+        with patch("keystone_crawler.extract_oem_tab_values", return_value={
+            "interchange": "101-60187",
+            "oem": "2928851925",
+            "partslink": "HY1115122",
+            "multiple": False,
+        }):
+            rows = extract(Page(), [], "101-60187", "Interchange Number")
+
+        self.assertEqual(rows[0]["Partslink Number"], "HY1115122")
+
+    def test_oem_tab_partslink_overrides_catalog_record_for_interchange_search(self):
+        class Page:
+            def evaluate(self, script):
+                return {"tables": [], "dl": [], "body": ""}
+
+        catalog_record = {
+            "Partslink Number": "MB1000490",
+            "Interchange Number": "101-60187",
+            "OEM Number": "2928851925",
+        }
+        with patch(
+            "keystone_crawler.walk_json",
+            side_effect=lambda body, path, records: records.append(catalog_record),
+        ), patch("keystone_crawler.extract_oem_tab_values", return_value={
+            "interchange": "101-60187",
+            "oem": "2928851925",
+            "partslink": "HY1115122",
+            "multiple": False,
+        }):
+            rows = extract(Page(), [("response", {})], "101-60187", "Interchange Number")
+
+        self.assertEqual(rows[0]["Partslink Number"], "HY1115122")
 
     def test_interchange_search_does_not_treat_oem_code_as_partslink(self):
         class Page:

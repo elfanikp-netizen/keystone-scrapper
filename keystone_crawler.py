@@ -419,7 +419,8 @@ def extract(page, captured_json, part=None, search_column="Partslink Number"):
             is_multiple_number(interchange_value) or is_multiple_number(oem_value)
         )
         row["Partslink Number"] = (
-            extract_partslink_number(rec.get("Partslink Number", ""))
+            (oem_values.get("partslink") if interchange_search else "")
+            or extract_partslink_number(rec.get("Partslink Number", ""))
             or (page_partslink if interchange_search else "")
             or (extract_partslink_number(rec) if not interchange_search else "")
             or parsed_partslink
@@ -441,14 +442,18 @@ def extract(page, captured_json, part=None, search_column="Partslink Number"):
         fallback = apply_number_slots(fallback, interchange_value, oem_value)
         fallback[NUMBER_VALUES_FIELD] = number_values_from_row(fallback)
         fallback[MULTIPLE_NUMBER_FIELD] = bool(oem_values.get("multiple"))
-        fallback["Partslink Number"] = page_partslink or parsed_partslink
+        fallback["Partslink Number"] = (
+            oem_values.get("partslink") or page_partslink or parsed_partslink
+        )
         rows.append(fallback)
 
     if not rows and (page_partslink or parsed_partslink):
         fallback = {field: "" for field in FIELDS + INTERCHANGE_FIELDS + OEM_FIELDS}
         fallback[NUMBER_VALUES_FIELD] = ""
         fallback[MULTIPLE_NUMBER_FIELD] = False
-        fallback["Partslink Number"] = page_partslink or parsed_partslink
+        fallback["Partslink Number"] = (
+            oem_values.get("partslink") or page_partslink or parsed_partslink
+        )
         rows.append(fallback)
 
     return rows
@@ -513,7 +518,7 @@ def is_oem_candidate(token):
         return False
     if token.isdigit() and len(token) < 5:
         return False
-    if re.fullmatch(r"\d{5,12}", token):
+    if re.fullmatch(r"\d{5,20}", token):
         return True
     if not re.fullmatch(r"(?i)[A-Za-z0-9][A-Za-z0-9-_ ]{4,19}", token):
         return False
@@ -526,7 +531,7 @@ def extract_oem_tab_values(page, part=None, exclude_search_value=True):
     try:
         bodies = page.locator('.mat-tab-body-wrapper .mat-tab-body')
         if bodies.count() == 0:
-            return {"interchange": "", "oem": "", "multiple": False}
+            return {"interchange": "", "oem": "", "partslink": "", "multiple": False}
         active = page.locator('.mat-tab-body-wrapper .mat-tab-body-active')
         candidates = active if active.count() else bodies
         tab_text = ""
@@ -535,12 +540,13 @@ def extract_oem_tab_values(page, part=None, exclude_search_value=True):
             if tab_text.strip():
                 break
     except Exception:
-        return {"interchange": "", "oem": "", "multiple": False}
+        return {"interchange": "", "oem": "", "partslink": "", "multiple": False}
 
     if not tab_text:
-        return {"interchange": "", "oem": "", "multiple": False}
+        return {"interchange": "", "oem": "", "partslink": "", "multiple": False}
 
     print(f"Reading OEM tab values: {tab_text[:250]}")
+    partslink = extract_partslink_number(tab_text)
     interchange_candidates = []
     oem_candidates = []
     for token in re.findall(r"[A-Za-z0-9-]+", tab_text):
@@ -563,7 +569,13 @@ def extract_oem_tab_values(page, part=None, exclude_search_value=True):
     number_values = join_number_values(interchange, oem)
     multiple = len(interchange_tokens) > 1 or len(oem_tokens) > 1
     print(f"Parsed OEM values -> Interchange: {interchange}, OEM: {oem}, Number Values: {number_values}, Multiple: {multiple}")
-    return {"interchange": interchange, "oem": oem, "number_values": number_values, "multiple": multiple}
+    return {
+        "interchange": interchange,
+        "oem": oem,
+        "partslink": partslink,
+        "number_values": number_values,
+        "multiple": multiple,
+    }
 
 
 def open_oem_tab(page):
@@ -783,11 +795,19 @@ def click_result_candidate(page, part):
                 (card for card, text in visible_cards if part.casefold() in text.casefold()),
                 visible_cards[0][0],
             )
-            image = selected.locator(".part-card-image").first
-            target = image if image.count() and image.is_visible() else selected
-            target.click(timeout=8000)
-            wait_settled(page)
-            return True
+            targets = [
+                selected.locator(".lkq-link a").first,
+                selected.locator(".part-card-image").first,
+                selected,
+            ]
+            for target in targets:
+                try:
+                    if target.count() and target.is_visible():
+                        target.click(timeout=8000)
+                        wait_settled(page)
+                        return True
+                except Exception:
+                    continue
         except Exception:
             continue
 
@@ -1023,18 +1043,6 @@ def run(args):
         )
     parts = all_parts[: args.limit] if args.limit else all_parts
     results = {} if args.fresh else load_results(args.output, search_column)
-    partslink_mapping = read_partslink_mapping(args.input, search_column)
-    if partslink_mapping:
-        backfilled = False
-        for query, rows in results.items():
-            mapped_partslink = partslink_mapping.get(query, "")
-            if mapped_partslink:
-                for row in rows:
-                    if row.get("Partslink Number") != mapped_partslink:
-                        row["Partslink Number"] = mapped_partslink
-                        backfilled = True
-        if backfilled:
-            save_results(args.output, all_parts, results, search_column)
     todo = [x for x in parts
             if not any(r["Status"] == "OK" for r in results.get(x, []))]
     print(f"{len(parts) - len(todo)} already done, {len(todo)} to process.")
@@ -1067,7 +1075,6 @@ def run(args):
                 results[part] = []
                 for row in rows:
                     result = {result_column: part, **row, "Status": status}
-                    result = apply_partslink_mapping(result, part, partslink_mapping)
                     if search_column.strip().casefold() == "partslink number":
                         result["Partslink Number"] = part
                     results[part].append(result)
