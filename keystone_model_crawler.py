@@ -2,8 +2,11 @@
 """Search Keystone Crash by vehicle/model and crawl every matching part."""
 
 import argparse
+import json
+import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,12 +39,31 @@ OUTPUT_COLUMNS = [
     *OEM_FIELDS,
     "Number Values",
     "Description",
+    "Search Key",
+    "Search Status",
 ]
 PARTSLINK_PATTERN = re.compile(r"\b[A-Z]{1,4}[- ]?\d{5,10}[A-Z]?\b", re.I)
 
 
 def clean(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def search_key(record):
+    return json.dumps(
+        [clean(record[column]).casefold() for column in INPUT_COLUMNS],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def completed_search_keys(rows):
+    return {
+        clean(row.get("Search Key"))
+        for row in rows
+        if clean(row.get("Search Key"))
+        and clean(row.get("Search Status")).casefold() in {"ok", "no data"}
+    }
 
 
 def split_categories(value):
@@ -427,7 +449,22 @@ def crawl_results(page, record):
 
 
 def save_results(path, rows):
-    pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_excel(path, index=False)
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.stem}.",
+            suffix=output_path.suffix,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_excel(temporary_path, index=False)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def run(args):
@@ -435,6 +472,8 @@ def run(args):
     if args.limit:
         rows = rows[:args.limit]
     if not rows:
+        base.ensure_runtime_dependencies()
+        save_results(args.output, [])
         print("No input rows to process.")
         return
     base.ensure_runtime_dependencies()
@@ -443,18 +482,39 @@ def run(args):
     if not args.fresh and Path(args.output).exists():
         existing = pd.read_excel(args.output, dtype=str).fillna("")
         output_rows = existing.to_dict(orient="records")
+    completed = completed_search_keys(output_rows)
+    pending = [record for record in rows if search_key(record) not in completed]
+    print(f"{len(rows) - len(pending)} already done, {len(pending)} to process.")
+    if not pending:
+        return
 
     with base.sync_playwright() as playwright:
         browser, context, page = base.make_context(playwright, headed=args.show)
         base.ensure_logged_in(page, context, headed=args.show, force_manual=args.manual_login)
         try:
-            for index, record in enumerate(rows, 1):
+            for index, record in enumerate(pending, 1):
+                record_key = search_key(record)
+                if record_key in completed:
+                    continue
                 print(f"[{index}/{len(rows)}] Search: {record['Year']} {record['Brand']} "
                       f"{record['Model']} / {record['Parts']} / {record['Category']}")
                 search_model(page, record)
                 results = crawl_results(page, record)
+                search_status = "OK" if results else "NO DATA"
+                for result in results:
+                    result["Search Key"] = search_key(record)
+                    result["Search Status"] = search_status
+                if not results:
+                    results = [{
+                        **{column: "" for column in OUTPUT_COLUMNS},
+                        "Brand": record["Brand"],
+                        "Model": record["Model"],
+                        "Search Key": search_key(record),
+                        "Search Status": search_status,
+                    }]
                 output_rows.extend(results)
                 save_results(args.output, output_rows)
+                completed.add(record_key)
                 print(f"[{index}/{len(rows)}] Saved {len(results)} result(s) to {args.output}")
                 time.sleep(1)
         finally:

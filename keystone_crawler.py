@@ -27,6 +27,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -992,7 +993,22 @@ def save_results(path, order, results, search_column="Partslink Number"):
         if col not in df.columns:
             df[col] = ""
     df = df[columns]
-    df.to_excel(path, index=False)
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.stem}.",
+            suffix=output_path.suffix,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        df.to_excel(temporary_path, index=False)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1085,8 +1101,7 @@ def run(args):
                 if not rows:
                     print(f"[{n}/{len(todo)}] {part}: Interchange= | OEM= | Status={status}")
                 print(f"[{n}/{len(todo)}] {part}: {status} ({len(rows) if status == 'OK' else 0} row(s))")
-                if n % 10 == 0:
-                    save_results(args.output, all_parts, results, search_column)
+                save_results(args.output, all_parts, results, search_column)
                 time.sleep(random.uniform(CONFIG["delay_min"], CONFIG["delay_max"]))
         finally:
             save_results(args.output, all_parts, results, search_column)
