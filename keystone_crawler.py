@@ -376,6 +376,53 @@ def is_interchange_search(search_column):
     return bool(re.search(r"\binterchange\b", str(search_column), re.I))
 
 
+def parse_fitments_text(text):
+    """Extract the year range and vehicle identity from Fitments tab rows."""
+    fitments = []
+    for line in str(text or "").splitlines():
+        match = re.match(r"^\s*((?:19|20)\d{2})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        vehicle = match.group(2).split()
+        if len(vehicle) < 2:
+            continue
+        fitments.append((int(match.group(1)), vehicle[0], " ".join(vehicle[1:])))
+
+    if not fitments:
+        return {}
+    return {
+        "Oldest Year": str(min(item[0] for item in fitments)),
+        "Newest Year": str(max(item[0] for item in fitments)),
+        "Brand": fitments[0][1],
+        "Model": fitments[0][2],
+    }
+
+
+def extract_fitments_tab_values(page):
+    """Read and parse the Fitments tab for the current catalog part."""
+    selectors = [
+        'button:has-text("Fitments")', 'a:has-text("Fitments")',
+        '[role="tab"]:has-text("Fitments")', 'mat-tab-label:has-text("Fitments")',
+    ]
+    for selector in selectors:
+        try:
+            tab = page.locator(selector).first
+            if tab and tab.is_visible():
+                tab.click(timeout=5000)
+                wait_settled(page, 500)
+                break
+        except Exception:
+            continue
+
+    try:
+        active = page.locator('.mat-tab-body-wrapper .mat-tab-body-active')
+        if active.count():
+            return parse_fitments_text(active.first.inner_text())
+    except Exception:
+        pass
+    return {}
+
+
 def extract(page, captured_json, part=None, search_column="Partslink Number"):
     json_recs = []
     for _, body in captured_json:
@@ -397,6 +444,7 @@ def extract(page, captured_json, part=None, search_column="Partslink Number"):
     best = json_recs if score(json_recs) >= score(table_recs) else table_recs
 
     rows, seen = [], set()
+    fitment_values = extract_fitments_tab_values(page)
     oem_values = extract_oem_tab_values(
         page,
         part,
@@ -406,6 +454,7 @@ def extract(page, captured_json, part=None, search_column="Partslink Number"):
         for f in FIELDS:                      # fill gaps from page-level labels
             if f not in rec and f in page_rec:
                 rec[f] = page_rec[f]
+        rec.update(fitment_values)
         row = {f: rec.get(f, "") for f in FIELDS}
 
         interchange_value = (
@@ -432,10 +481,11 @@ def extract(page, captured_json, part=None, search_column="Partslink Number"):
             seen.add(key)
             rows.append(row)
 
-    if not rows and any(oem_values.values()):
+    if not rows and (any(oem_values.values()) or fitment_values):
         fallback = {f: "" for f in FIELDS}
         for field in INTERCHANGE_FIELDS + OEM_FIELDS:
             fallback[field] = ""
+        fallback.update(fitment_values)
         interchange_value = oem_values.get("interchange", "") or (
             part if interchange_search else ""
         )
