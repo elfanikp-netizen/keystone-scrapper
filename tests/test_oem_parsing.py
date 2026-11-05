@@ -10,18 +10,177 @@ from keystone_crawler import (
     NUMBER_VALUES_FIELD,
     apply_partslink_mapping,
     extract,
+    extract_fitments_tab_values,
     extract_partslink_number,
     is_oem_candidate,
     join_number_values,
     normalize_number_tokens,
     extract_oem_tab_values,
+    load_results,
     output_columns,
+    parse_fitments_text,
     read_partslink_mapping,
+    read_parts,
+    save_results,
     split_number_values,
 )
 
 
 class OemParsingTests(unittest.TestCase):
+    def test_input_parts_keep_duplicate_rows(self):
+        with TemporaryDirectory() as directory:
+            input_path = Path(directory) / "parts.xlsx"
+            pd.DataFrame({"Partslink Number": ["GM1240366V", "GM1240366V"]}).to_excel(
+                input_path, index=False
+            )
+
+            self.assertEqual(read_parts(input_path, "Partslink Number"), [
+                "GM1240366V", "GM1240366V",
+            ])
+
+    def test_saved_results_repeat_once_per_duplicate_input_row(self):
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "results.xlsx"
+            query = "GM1240366V"
+            result = {column: "" for column in output_columns()}
+            result.update({"Partslink Number": query, "Status": "OK"})
+
+            save_results(output_path, [query, query], {query: [result]})
+            saved = pd.read_excel(output_path, dtype=str).fillna("")
+
+        self.assertEqual(saved["Partslink Number"].tolist(), [query, query])
+
+    def test_existing_single_result_expands_to_duplicate_input_rows(self):
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "results.xlsx"
+            query = "GM1240366V"
+            result = {column: "" for column in output_columns()}
+            result.update({"Partslink Number": query, "Status": "OK"})
+            save_results(output_path, [query], {query: [result]})
+
+            results = load_results(output_path)
+            save_results(output_path, [query, query], results)
+            saved = pd.read_excel(output_path, dtype=str).fillna("")
+
+        self.assertEqual(saved["Partslink Number"].tolist(), [query, query])
+
+    def test_fitments_text_produces_year_bounds_brand_and_model(self):
+        text = """2017 GMC TERRAIN
+2015 GMC TERRAIN
+2013 GMC TERRAIN
+2011 GMC TERRAIN
+2016 GMC TERRAIN
+2014 GMC TERRAIN
+2012 GMC TERRAIN
+2010 GMC TERRAIN"""
+
+        self.assertEqual(parse_fitments_text(text), {
+            "Oldest Year": "2010",
+            "Newest Year": "2017",
+            "Brand": "GMC",
+            "Model": "TERRAIN",
+        })
+
+    def test_fitments_are_read_from_active_fitments_tab(self):
+        class Tab:
+            first = None
+
+            def __init__(self):
+                self.first = self
+                self.clicked = False
+
+            def is_visible(self):
+                return True
+
+            def click(self, **kwargs):
+                self.clicked = True
+
+            def count(self):
+                return 1
+
+            def inner_text(self):
+                return "2017 GMC TERRAIN\n2010 GMC TERRAIN"
+
+        class Page:
+            def __init__(self):
+                self.tab = Tab()
+
+            def locator(self, selector):
+                if selector == 'button:has-text("Fitments")':
+                    return self.tab
+                if selector == '.mat-tab-body-wrapper .mat-tab-body-active':
+                    return self.tab
+                return TabCollection()
+
+        class TabCollection:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            def is_visible(self):
+                return False
+
+            def count(self):
+                return 0
+
+        page = Page()
+        with patch("keystone_crawler.wait_settled"):
+            values = extract_fitments_tab_values(page)
+
+        self.assertTrue(page.tab.clicked)
+        self.assertEqual(values, {
+            "Oldest Year": "2010",
+            "Newest Year": "2017",
+            "Brand": "GMC",
+            "Model": "TERRAIN",
+        })
+
+    def test_fitments_values_override_other_extracted_vehicle_fields(self):
+        class Page:
+            def evaluate(self, script):
+                return {
+                    "tables": [],
+                    "dl": [],
+                    "body": "Oldest Year: 2008\nNewest Year: 2020\nBrand: Other\nModel: Vehicle",
+                }
+
+        fitments = {
+            "Oldest Year": "2010",
+            "Newest Year": "2017",
+            "Brand": "GMC",
+            "Model": "TERRAIN",
+        }
+        with patch("keystone_crawler.extract_fitments_tab_values", return_value=fitments), \
+                patch("keystone_crawler.extract_oem_tab_values", return_value={}):
+            rows = extract(Page(), [], "GM1240366V")
+
+        self.assertEqual(
+            {field: rows[0][field] for field in fitments},
+            fitments,
+        )
+
+    def test_fitments_alone_still_produce_a_result_row(self):
+        class Page:
+            def evaluate(self, script):
+                return {"tables": [], "dl": [], "body": ""}
+
+        fitments = {
+            "Oldest Year": "2010",
+            "Newest Year": "2017",
+            "Brand": "GMC",
+            "Model": "TERRAIN",
+        }
+        with patch("keystone_crawler.extract_fitments_tab_values", return_value=fitments), \
+                patch("keystone_crawler.extract_oem_tab_values", return_value={}):
+            rows = extract(Page(), [], "GM1240366V")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            {field: rows[0][field] for field in fitments},
+            fitments,
+        )
+
     def test_numeric_oem_values_are_accepted(self):
         self.assertTrue(is_oem_candidate("22818031"))
         self.assertTrue(is_oem_candidate("16688518389999"))

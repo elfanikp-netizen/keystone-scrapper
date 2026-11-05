@@ -957,13 +957,12 @@ def read_parts(path, column):
                 break
     if col is None:
         col = df.columns[0]
-    parts, seen = [], set()
+    parts = []
     for v in df[col].dropna():
         v = str(v).strip()
-        if v and v not in seen:
-            seen.add(v)
+        if v:
             parts.append(v)
-    print(f"Read {len(parts)} unique numbers from column '{col}' of {path}")
+    print(f"Read {len(parts)} input rows from column '{col}' of {path}")
     return parts
 
 
@@ -1029,7 +1028,10 @@ def load_results(path, search_column="Partslink Number"):
             if col not in df.columns:
                 df[col] = ""
         for _, r in df.iterrows():
-            results.setdefault(r[result_column], []).append({c: r.get(c, "") for c in columns})
+            record = {c: r.get(c, "") for c in columns}
+            group = results.setdefault(r[result_column], [])
+            if record not in group:
+                group.append(record)
     return results
 
 
@@ -1059,6 +1061,15 @@ def save_results(path, order, results, search_column="Partslink Number"):
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def pending_queries(parts, results):
+    """Return each selected search value once unless its saved result succeeded."""
+    unique_parts = list(dict.fromkeys(parts))
+    return [
+        part for part in unique_parts
+        if not any(row.get("Status") == "OK" for row in results.get(part, []))
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -1109,10 +1120,11 @@ def run(args):
         )
     parts = all_parts[: args.limit] if args.limit else all_parts
     results = {} if args.fresh else load_results(args.output, search_column)
-    todo = [x for x in parts
-            if not any(r["Status"] == "OK" for r in results.get(x, []))]
-    print(f"{len(parts) - len(todo)} already done, {len(todo)} to process.")
+    todo = pending_queries(parts, results)
+    unique_parts = list(dict.fromkeys(parts))
+    print(f"{len(unique_parts) - len(todo)} already done, {len(todo)} to process.")
     if not todo:
+        save_results(args.output, parts, results, search_column)
         return
 
     with sync_playwright() as p:
