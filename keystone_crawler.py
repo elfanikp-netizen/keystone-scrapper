@@ -380,6 +380,7 @@ def parse_fitments_text(text):
     """Extract the year range and vehicle identity from Fitments tab rows."""
     fitments = []
     for line in str(text or "").splitlines():
+        line = line.replace("_", " ")
         match = re.match(r"^\s*((?:19|20)\d{2})\s+(.+?)\s*$", line)
         if not match:
             continue

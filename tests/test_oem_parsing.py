@@ -81,6 +81,14 @@ class OemParsingTests(unittest.TestCase):
             "Model": "TERRAIN",
         })
 
+    def test_fitments_text_replaces_underscores_in_vehicle_fields(self):
+        self.assertEqual(parse_fitments_text("2018_GMC_TERRAIN_SLE"), {
+            "Oldest Year": "2018",
+            "Newest Year": "2018",
+            "Brand": "GMC",
+            "Model": "TERRAIN SLE",
+        })
+
     def test_fitments_are_read_from_active_fitments_tab(self):
         class Tab:
             first = None

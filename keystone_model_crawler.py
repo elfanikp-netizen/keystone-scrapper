@@ -80,8 +80,13 @@ def split_categories(value):
 
 
 def parse_year_bounds(text):
-    years = [int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", text or "")]
+    text = str(text or "").replace("_", " ")
+    years = [int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", text)]
     return (str(min(years)), str(max(years))) if years else ("", "")
+
+
+def clean_vehicle_value(value):
+    return clean(value).replace("_", " ").strip()
 
 
 def part_type_from_interchange(value):
@@ -388,8 +393,8 @@ def extract_result(page, record, result_text):
         "Partslink Number": part,
         "Oldest Year": oldest,
         "Newest Year": newest,
-        "Brand": record["Brand"],
-        "Model": record["Model"],
+        "Brand": clean_vehicle_value(record["Brand"]),
+        "Model": clean_vehicle_value(record["Model"]),
         "Interchange Number": numbers.get("interchange", ""),
         "Part Type": part_type_from_interchange(numbers.get("interchange", "")),
         "OEM Number": numbers.get("oem", ""),

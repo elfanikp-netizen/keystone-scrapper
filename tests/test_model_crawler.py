@@ -3,6 +3,7 @@ import unittest
 from keystone_model_crawler import (
     OUTPUT_COLUMNS,
     _partslink_from_text,
+    clean_vehicle_value,
     part_type_from_interchange,
     parse_year_bounds,
     split_categories,
@@ -15,6 +16,10 @@ class ModelCrawlerTests(unittest.TestCase):
 
     def test_year_bounds_use_oldest_and_newest_years(self):
         self.assertEqual(parse_year_bounds("2018 Toyota Camry fits 2019-2022"), ("2018", "2022"))
+
+    def test_vehicle_result_fields_replace_underscores(self):
+        self.assertEqual(parse_year_bounds("2018_2022_GMC_TERRAIN"), ("2018", "2022"))
+        self.assertEqual(clean_vehicle_value("GMC_TERRAIN_SLE"), "GMC TERRAIN SLE")
 
     def test_output_includes_requested_number_slots_and_description(self):
         self.assertIn("Interchange Number 5", OUTPUT_COLUMNS)
